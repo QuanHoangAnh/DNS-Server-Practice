@@ -19,28 +19,43 @@ async Task StartServer()
             UdpReceiveResult receiveResult = await udpClient.ReceiveAsync();
             Console.WriteLine($"Received packet from {receiveResult.RemoteEndPoint}");
 
-            // Construct a response message with a hardcoded header and question.
+            // Parse the incoming query to extract the ID
+            var queryData = receiveResult.Buffer;
+            ushort queryId = 1234; // Default fallback
+
+            if (queryData.Length >= 2)
+            {
+                // Extract ID from the first 2 bytes (network byte order)
+                queryId = (ushort)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(queryData, 0));
+            }
+
+            // Construct a full response with header, question, and answer.
             var responseMessage = new DnsMessage
             {
                 Header = new DnsHeader
                 {
-                    PacketIdentifier = 1234,
+                    PacketIdentifier = queryId, // Use the ID from the query
                     QueryResponse = true,
                     OpCode = 0,
                     ResponseCode = 0,
-                    // Set QuestionCount to 1 as we are including one question.
                     QuestionCount = 1,
-                    AnswerRecordCount = 0,
-                    // Other flags and counts are 0 for this stage.
+                    // Set AnswerRecordCount to 1.
+                    AnswerRecordCount = 1,
                 },
                 Questions = new List<DnsQuestion>
                 {
-                    new DnsQuestion
+                    new() { Name = "codecrafters.io", Type = 1, Class = 1 }
+                },
+                Answers = new List<DnsResourceRecord>
+                {
+                    new()
                     {
-                        // As per the spec for this stage.
                         Name = "codecrafters.io",
-                        Type = 1, // A record
-                        Class = 1 // IN (Internet)
+                        Type = 1, // A Record
+                        Class = 1, // IN (Internet)
+                        Ttl = 60, // A reasonable TTL
+                        RdLength = 4, // Length of an IPv4 address
+                        Rdata = new byte[] { 8, 8, 8, 8 }
                     }
                 }
             };
@@ -50,7 +65,7 @@ async Task StartServer()
 
             // Send the serialized response back to the client.
             await udpClient.SendAsync(responseBytes, responseBytes.Length, receiveResult.RemoteEndPoint);
-            Console.WriteLine($"Sent question response to {receiveResult.RemoteEndPoint}");
+            Console.WriteLine($"Sent full response to {receiveResult.RemoteEndPoint}");
         }
     }
     catch (SocketException e)
@@ -89,13 +104,26 @@ public class DnsQuestion
 }
 
 /// <summary>
+/// Represents a Resource Record (RR) in the answer, authority, or additional sections.
+/// </summary>
+public class DnsResourceRecord
+{
+    public string Name { get; set; } = string.Empty;
+    public ushort Type { get; set; }
+    public ushort Class { get; set; }
+    public uint Ttl { get; set; }
+    public ushort RdLength { get; set; }
+    public byte[] Rdata { get; set; } = Array.Empty<byte>();
+}
+
+/// <summary>
 /// Represents a full DNS message.
 /// </summary>
 public class DnsMessage
 {
     public DnsHeader Header { get; set; } = new();
     public List<DnsQuestion> Questions { get; set; } = new();
-    // Answer section will be added in the next stage.
+    public List<DnsResourceRecord> Answers { get; set; } = new();
 }
 
 /// <summary>
@@ -145,6 +173,17 @@ public static class DnsPacketSerializer
                 EncodeDomainName(writer, question.Name);
                 writer.Write(IPAddress.HostToNetworkOrder((short)question.Type));
                 writer.Write(IPAddress.HostToNetworkOrder((short)question.Class));
+            }
+
+            // --- Answer Section ---
+            foreach (var answer in message.Answers)
+            {
+                EncodeDomainName(writer, answer.Name);
+                writer.Write(IPAddress.HostToNetworkOrder((short)answer.Type));
+                writer.Write(IPAddress.HostToNetworkOrder((short)answer.Class));
+                writer.Write(IPAddress.HostToNetworkOrder((int)answer.Ttl));
+                writer.Write(IPAddress.HostToNetworkOrder((short)answer.RdLength));
+                writer.Write(answer.Rdata);
             }
         }
         return stream.ToArray();
