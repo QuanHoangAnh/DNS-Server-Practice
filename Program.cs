@@ -2,6 +2,7 @@
 
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 
 // Main program entry point and server logic
 await StartServer();
@@ -18,25 +19,29 @@ async Task StartServer()
             UdpReceiveResult receiveResult = await udpClient.ReceiveAsync();
             Console.WriteLine($"Received packet from {receiveResult.RemoteEndPoint}");
 
-            // For this stage, we ignore the incoming packet's content.
-            // We construct a response with a hardcoded header as per the specification.
-
+            // Construct a response message with a hardcoded header and question.
             var responseMessage = new DnsMessage
             {
                 Header = new DnsHeader
                 {
                     PacketIdentifier = 1234,
-                    QueryResponse = true, // This is a response
-                    OpCode = 0, // Standard query
-                    AuthoritativeAnswer = false,
-                    Truncation = false,
-                    RecursionDesired = false, // We are not requesting recursion
-                    RecursionAvailable = false, // We do not offer recursion
-                    ResponseCode = 0, // No error
-                    QuestionCount = 0,
+                    QueryResponse = true,
+                    OpCode = 0,
+                    ResponseCode = 0,
+                    // Set QuestionCount to 1 as we are including one question.
+                    QuestionCount = 1,
                     AnswerRecordCount = 0,
-                    AuthorityRecordCount = 0,
-                    AdditionalRecordCount = 0
+                    // Other flags and counts are 0 for this stage.
+                },
+                Questions = new List<DnsQuestion>
+                {
+                    new DnsQuestion
+                    {
+                        // As per the spec for this stage.
+                        Name = "codecrafters.io",
+                        Type = 1, // A record
+                        Class = 1 // IN (Internet)
+                    }
                 }
             };
 
@@ -45,7 +50,7 @@ async Task StartServer()
 
             // Send the serialized response back to the client.
             await udpClient.SendAsync(responseBytes, responseBytes.Length, receiveResult.RemoteEndPoint);
-            Console.WriteLine($"Sent header response to {receiveResult.RemoteEndPoint}");
+            Console.WriteLine($"Sent question response to {receiveResult.RemoteEndPoint}");
         }
     }
     catch (SocketException e)
@@ -74,12 +79,23 @@ public class DnsHeader
 }
 
 /// <summary>
-/// Represents a full DNS message, including header, questions, and answers.
+/// Represents a question in the DNS message's question section.
+/// </summary>
+public class DnsQuestion
+{
+    public string Name { get; set; } = string.Empty;
+    public ushort Type { get; set; }
+    public ushort Class { get; set; }
+}
+
+/// <summary>
+/// Represents a full DNS message.
 /// </summary>
 public class DnsMessage
 {
     public DnsHeader Header { get; set; } = new();
-    // Question, Answer, etc. sections will be added in later stages.
+    public List<DnsQuestion> Questions { get; set; } = new();
+    // Answer section will be added in the next stage.
 }
 
 /// <summary>
@@ -122,7 +138,37 @@ public static class DnsPacketSerializer
 
             // Additional Record Count (ARCOUNT) - 16 bits
             writer.Write(IPAddress.HostToNetworkOrder((short)message.Header.AdditionalRecordCount));
+
+            // --- Question Section ---
+            foreach (var question in message.Questions)
+            {
+                EncodeDomainName(writer, question.Name);
+                writer.Write(IPAddress.HostToNetworkOrder((short)question.Type));
+                writer.Write(IPAddress.HostToNetworkOrder((short)question.Class));
+            }
         }
         return stream.ToArray();
+    }
+
+    /// <summary>
+    /// Encodes a domain name like "google.com" into the DNS label format:
+    /// 6, 'g','o','o','g','l','e', 3, 'c','o','m', 0
+    /// </summary>
+    private static void EncodeDomainName(BinaryWriter writer, string domainName)
+    {
+        if (string.IsNullOrEmpty(domainName) || domainName == ".")
+        {
+            writer.Write((byte)0); // Null terminator for root domain
+            return;
+        }
+
+        var labels = domainName.Split('.');
+        foreach (var label in labels)
+        {
+            var labelBytes = Encoding.ASCII.GetBytes(label);
+            writer.Write((byte)labelBytes.Length);
+            writer.Write(labelBytes);
+        }
+        writer.Write((byte)0); // Null terminator for the entire name
     }
 }
