@@ -1,13 +1,32 @@
 ﻿// File: Program.cs
 
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 
-// Main program entry point and server logic
-await StartServer();
+// Parse command-line arguments
+IPEndPoint? resolverEndpoint = null;
+if (args.Length > 1 && args[0] == "--resolver")
+{
+    var parts = args[1].Split(':');
+    if (parts.Length == 2 && IPAddress.TryParse(parts[0], out var ip) && int.TryParse(parts[1], out var port) && port > 0 && port <= 65535)
+    {
+        resolverEndpoint = new IPEndPoint(ip, port);
+        Console.WriteLine($"Forwarding queries to resolver: {resolverEndpoint}");
+    }
+    else
+    {
+        Console.WriteLine("Invalid resolver format. Expected format: --resolver <ip>:<port>");
+        Console.WriteLine("IP must be valid and port must be between 1-65535");
+        return;
+    }
+}
 
-async Task StartServer()
+// Main program entry point and server logic
+await StartServer(resolverEndpoint);
+
+async Task StartServer(IPEndPoint? resolver)
 {
     using var udpClient = new UdpClient(new IPEndPoint(IPAddress.Any, 2053));
     Console.WriteLine("DNS server listening on port 2053...");
@@ -19,8 +38,22 @@ async Task StartServer()
             UdpReceiveResult receiveResult = await udpClient.ReceiveAsync();
             Console.WriteLine($"Received packet from {receiveResult.RemoteEndPoint}");
 
-            DnsMessage requestMessage = DnsPacketSerializer.FromByteArray(receiveResult.Buffer);
-            if (requestMessage.Questions.Count == 0) continue;
+            DnsMessage requestMessage;
+            try
+            {
+                requestMessage = DnsPacketSerializer.FromByteArray(receiveResult.Buffer);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to parse DNS packet: {ex.Message}");
+                continue;
+            }
+
+            if (requestMessage.Questions.Count == 0)
+            {
+                Console.WriteLine("Ignoring packet with zero questions");
+                continue;
+            }
 
             Console.WriteLine($"Received {requestMessage.Questions.Count} questions.");
             foreach(var q in requestMessage.Questions)
@@ -28,40 +61,112 @@ async Task StartServer()
                 Console.WriteLine($"  - Query for: {q.Name}");
             }
 
-            var responseMessage = new DnsMessage();
-            responseMessage.Header.PacketIdentifier = requestMessage.Header.PacketIdentifier;
-            responseMessage.Header.RecursionDesired = requestMessage.Header.RecursionDesired;
-            responseMessage.Header.OpCode = requestMessage.Header.OpCode;
-            responseMessage.Header.QueryResponse = true;
-            responseMessage.Header.ResponseCode = requestMessage.Header.OpCode == 0 ? (byte)0 : (byte)4;
-
-            // Copy all questions from request to response
-            responseMessage.Questions.AddRange(requestMessage.Questions);
-            responseMessage.Header.QuestionCount = (ushort)requestMessage.Questions.Count;
-
-            // Create an answer for each question
-            foreach (var question in requestMessage.Questions)
+            byte[] responseBytes;
+            if (resolver == null)
             {
-                responseMessage.Answers.Add(new DnsResourceRecord
-                {
-                    Name = question.Name,
-                    Type = 1, // A Record
-                    Class = 1, // IN (Internet)
-                    Ttl = 60,
-                    RdLength = 4,
-                    Rdata = new byte[] { 8, 8, 8, 8 } // Still a hardcoded IP
-                });
+                // No resolver configured, act as an authoritative server (Stages 1-7)
+                responseBytes = CreateAuthoritativeResponse(requestMessage);
             }
-            responseMessage.Header.AnswerRecordCount = (ushort)responseMessage.Answers.Count;
+            else
+            {
+                // Resolver is configured, act as a forwarding server (Stage 8)
+                responseBytes = await CreateForwardingResponse(requestMessage, resolver, receiveResult.Buffer);
+            }
 
-            byte[] responseBytes = DnsPacketSerializer.ToByteArray(responseMessage);
             await udpClient.SendAsync(responseBytes, responseBytes.Length, receiveResult.RemoteEndPoint);
-            Console.WriteLine($"Sent response with {responseMessage.Answers.Count} answers to {receiveResult.RemoteEndPoint}");
+            Console.WriteLine($"Sent response to {receiveResult.RemoteEndPoint}");
         }
     }
     catch (SocketException e)
     {
         Console.WriteLine($"SocketException: {e.Message}");
+    }
+}
+
+byte[] CreateAuthoritativeResponse(DnsMessage request)
+{
+    var responseMessage = new DnsMessage();
+    responseMessage.Header.PacketIdentifier = request.Header.PacketIdentifier;
+    responseMessage.Header.QueryResponse = true;
+    responseMessage.Header.OpCode = request.Header.OpCode;
+    responseMessage.Header.RecursionDesired = request.Header.RecursionDesired;
+    responseMessage.Header.ResponseCode = request.Header.OpCode == 0 ? (byte)0 : (byte)4;
+
+    responseMessage.Questions.AddRange(request.Questions);
+    responseMessage.Header.QuestionCount = (ushort)request.Questions.Count;
+
+    foreach (var question in request.Questions)
+    {
+        responseMessage.Answers.Add(new DnsResourceRecord
+        {
+            Name = question.Name, Type = 1, Class = 1, Ttl = 60, RdLength = 4, Rdata = new byte[] { 8, 8, 8, 8 }
+        });
+    }
+    responseMessage.Header.AnswerRecordCount = (ushort)responseMessage.Answers.Count;
+
+    return DnsPacketSerializer.ToByteArray(responseMessage);
+}
+
+async Task<byte[]> CreateForwardingResponse(DnsMessage request, IPEndPoint resolver, byte[] originalRequestBytes)
+{
+    // The spec requires splitting multi-question requests.
+    if (request.Header.QuestionCount > 1)
+    {
+        // Complex case: Split the request, query for each, merge results.
+        var mergedAnswers = new ConcurrentBag<DnsResourceRecord>();
+        var tasks = request.Questions.Select(async question =>
+        {
+            var singleQuestionMessage = new DnsMessage
+            {
+                Header = new DnsHeader
+                {
+                    PacketIdentifier = request.Header.PacketIdentifier, // Use original ID
+                    OpCode = request.Header.OpCode,
+                    RecursionDesired = request.Header.RecursionDesired,
+                    QuestionCount = 1
+                },
+                Questions = { question }
+            };
+            byte[] singleRequestBytes = DnsPacketSerializer.ToByteArray(singleQuestionMessage);
+
+            using var forwarderClient = new UdpClient();
+            await forwarderClient.SendAsync(singleRequestBytes, singleRequestBytes.Length, resolver);
+            var result = await forwarderClient.ReceiveAsync();
+            var singleResponseMessage = DnsPacketSerializer.FromByteArray(result.Buffer);
+            foreach (var answer in singleResponseMessage.Answers)
+            {
+                mergedAnswers.Add(answer);
+            }
+        });
+        await Task.WhenAll(tasks);
+
+        // Build the final merged response
+        var finalResponseMessage = new DnsMessage
+        {
+            Header = request.Header, // Use original header as a base
+            Questions = request.Questions,
+            Answers = mergedAnswers.ToList()
+        };
+        finalResponseMessage.Header.QueryResponse = true;
+        finalResponseMessage.Header.AnswerRecordCount = (ushort)finalResponseMessage.Answers.Count;
+        finalResponseMessage.Header.ResponseCode = 0; // Assume success if we got answers
+
+        return DnsPacketSerializer.ToByteArray(finalResponseMessage);
+    }
+    else
+    {
+        // Simple case: Forward the original packet bytes directly.
+        using var forwarderClient = new UdpClient();
+        await forwarderClient.SendAsync(originalRequestBytes, originalRequestBytes.Length, resolver);
+        var result = await forwarderClient.ReceiveAsync();
+        byte[] forwardedResponseBytes = result.Buffer;
+
+        // IMPORTANT: The resolver's response has a new Packet ID. We must
+        // overwrite it with the original ID from the client's request.
+        byte[] originalIdBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)request.Header.PacketIdentifier));
+        Buffer.BlockCopy(originalIdBytes, 0, forwardedResponseBytes, 0, 2);
+
+        return forwardedResponseBytes;
     }
 }
 
@@ -208,6 +313,11 @@ public static class DnsPacketSerializer
     /// </summary>
     public static DnsMessage FromByteArray(byte[] data)
     {
+        if (data == null || data.Length < 12)
+        {
+            throw new ArgumentException("DNS packet must be at least 12 bytes (header size)");
+        }
+
         var message = new DnsMessage();
         var stream = new MemoryStream(data);
         using (var reader = new BinaryReader(stream))
@@ -279,7 +389,7 @@ public static class DnsPacketSerializer
         var labels = new List<string>();
         byte length;
 
-        while ((length = reader.ReadByte()) != 0)
+        while (reader.BaseStream.Position < reader.BaseStream.Length && (length = reader.ReadByte()) != 0)
         {
             // Check if the two most significant bits are set (11), indicating a pointer.
             if ((length & 0xC0) == 0xC0)
@@ -317,7 +427,14 @@ public static class DnsPacketSerializer
             else
             {
                 // It's a standard length-prefixed label.
-                labels.Add(Encoding.ASCII.GetString(reader.ReadBytes(length)));
+                if (reader.BaseStream.Position + length <= reader.BaseStream.Length)
+                {
+                    labels.Add(Encoding.ASCII.GetString(reader.ReadBytes(length)));
+                }
+                else
+                {
+                    throw new InvalidOperationException("Domain name extends beyond packet boundary");
+                }
             }
         }
 
