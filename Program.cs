@@ -19,43 +19,44 @@ async Task StartServer()
             UdpReceiveResult receiveResult = await udpClient.ReceiveAsync();
             Console.WriteLine($"Received packet from {receiveResult.RemoteEndPoint}");
 
-            // 1. Parse the incoming request to get the question.
             DnsMessage requestMessage = DnsPacketSerializer.FromByteArray(receiveResult.Buffer);
-            var question = requestMessage.Questions.FirstOrDefault();
-            if (question == null) continue; // Ignore packets with no questions
+            if (requestMessage.Questions.Count == 0) continue;
 
-            Console.WriteLine($"Received query for: {question.Name}");
+            Console.WriteLine($"Received {requestMessage.Questions.Count} questions.");
+            foreach(var q in requestMessage.Questions)
+            {
+                Console.WriteLine($"  - Query for: {q.Name}");
+            }
 
-            // 2. Create the response message.
             var responseMessage = new DnsMessage();
-
-            // 3. Build the response header.
             responseMessage.Header.PacketIdentifier = requestMessage.Header.PacketIdentifier;
             responseMessage.Header.RecursionDesired = requestMessage.Header.RecursionDesired;
             responseMessage.Header.OpCode = requestMessage.Header.OpCode;
             responseMessage.Header.QueryResponse = true;
             responseMessage.Header.ResponseCode = requestMessage.Header.OpCode == 0 ? (byte)0 : (byte)4;
 
-            // 4. Copy the question from the request to the response.
-            responseMessage.Questions.Add(question);
-            responseMessage.Header.QuestionCount = 1;
+            // Copy all questions from request to response
+            responseMessage.Questions.AddRange(requestMessage.Questions);
+            responseMessage.Header.QuestionCount = (ushort)requestMessage.Questions.Count;
 
-            // 5. Create a corresponding answer record.
-            responseMessage.Answers.Add(new DnsResourceRecord
+            // Create an answer for each question
+            foreach (var question in requestMessage.Questions)
             {
-                Name = question.Name, // The name is now dynamic from the question
-                Type = 1, // A Record
-                Class = 1, // IN (Internet)
-                Ttl = 60,
-                RdLength = 4,
-                Rdata = new byte[] { 8, 8, 8, 8 } // Still a hardcoded IP for now
-            });
-            responseMessage.Header.AnswerRecordCount = 1;
+                responseMessage.Answers.Add(new DnsResourceRecord
+                {
+                    Name = question.Name,
+                    Type = 1, // A Record
+                    Class = 1, // IN (Internet)
+                    Ttl = 60,
+                    RdLength = 4,
+                    Rdata = new byte[] { 8, 8, 8, 8 } // Still a hardcoded IP
+                });
+            }
+            responseMessage.Header.AnswerRecordCount = (ushort)responseMessage.Answers.Count;
 
-            // 6. Serialize and send the response.
             byte[] responseBytes = DnsPacketSerializer.ToByteArray(responseMessage);
             await udpClient.SendAsync(responseBytes, responseBytes.Length, receiveResult.RemoteEndPoint);
-            Console.WriteLine($"Sent response for {question.Name} to {receiveResult.RemoteEndPoint}");
+            Console.WriteLine($"Sent response with {responseMessage.Answers.Count} answers to {receiveResult.RemoteEndPoint}");
         }
     }
     catch (SocketException e)
@@ -251,22 +252,75 @@ public static class DnsPacketSerializer
                     Class = (ushort)IPAddress.NetworkToHostOrder(reader.ReadInt16())
                 });
             }
+
+            // --- Answer Section ---
+            for (int i = 0; i < message.Header.AnswerRecordCount; i++)
+            {
+                var answer = new DnsResourceRecord
+                {
+                    Name = DecodeDomainName(reader),
+                    Type = (ushort)IPAddress.NetworkToHostOrder(reader.ReadInt16()),
+                    Class = (ushort)IPAddress.NetworkToHostOrder(reader.ReadInt16()),
+                    Ttl = (uint)IPAddress.NetworkToHostOrder(reader.ReadInt32()),
+                    RdLength = (ushort)IPAddress.NetworkToHostOrder(reader.ReadInt16())
+                };
+                answer.Rdata = reader.ReadBytes(answer.RdLength);
+                message.Answers.Add(answer);
+            }
         }
         return message;
     }
 
     /// <summary>
-    /// Decodes a domain name from a byte stream.
-    /// Handles the label format: <length><content><length><content>...<null>
+    /// Decodes a domain name, handling compression pointers.
     /// </summary>
     private static string DecodeDomainName(BinaryReader reader)
     {
         var labels = new List<string>();
         byte length;
+
         while ((length = reader.ReadByte()) != 0)
         {
-            labels.Add(Encoding.ASCII.GetString(reader.ReadBytes(length)));
+            // Check if the two most significant bits are set (11), indicating a pointer.
+            if ((length & 0xC0) == 0xC0)
+            {
+                // It's a pointer. The offset is in the next 14 bits.
+                // Mask out the top two bits from the first byte and combine with the second byte.
+                int offset = ((length & 0x3F) << 8) | reader.ReadByte();
+
+                // Save the current stream position
+                long currentPosition = reader.BaseStream.Position;
+
+                // Validate offset is within bounds
+                if (offset >= reader.BaseStream.Length)
+                    throw new InvalidOperationException($"Compression pointer offset {offset} is beyond stream length {reader.BaseStream.Length}");
+
+                // Jump to the offset to read the pointed-to name
+                reader.BaseStream.Position = offset;
+
+                // Recursively decode the name from the new position
+                string pointedName = DecodeDomainName(reader);
+
+                // If we have existing labels, combine them with the pointed name
+                if (labels.Count > 0)
+                {
+                    labels.Add(pointedName);
+                    pointedName = string.Join('.', labels);
+                }
+
+                // Restore the stream position to continue parsing after the pointer
+                reader.BaseStream.Position = currentPosition;
+
+                // A name that ends in a pointer is complete.
+                return pointedName;
+            }
+            else
+            {
+                // It's a standard length-prefixed label.
+                labels.Add(Encoding.ASCII.GetString(reader.ReadBytes(length)));
+            }
         }
+
         return string.Join('.', labels);
     }
 }
